@@ -1,0 +1,16 @@
+# Directories to exclude
+
+# Unfinished deployments
+glacier
+
+# BOX deployment
+box/manual-backups
+rclone_backup*
+
+# B2 deployment
+b2/backups
+b2/cozyhomes-downloads
+b2/cozyhomes-extracts
+b2/testdata/libs
+b2/logs
+

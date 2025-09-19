@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Safer defaults for cron environments
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+umask 077
+
+# ========= USER CONFIG =========
+HOME_DIR="/home4/uhdtdbmy"
+SOURCE_DIR="$HOME_DIR/gocozyhomes-backups/b2/testdata"      # directory to back up
+BACKUP_DIR="$HOME_DIR/gocozyhomes-backups/b2/backups"       # local folder to store zips
+REMOTE="b2:cozyhomes-www/backups"                           # rclone remote:bucket/path
+KEEP_LOCAL_DAYS=90                                          # days to keep local zips
+KEEP_REMOTE_DAYS=3650                                       # days to keep remote zips
+EXCLUDES_FILE=""                                            # optional: path to file with exclude patterns (one per line)
+BWLIMIT="0"                                                 # rclone bandwidth limit (e.g., "4M"); "0" = unlimited
+LOG_FILE="$HOME_DIR/gocozyhomes-backups/b2/logs/backup_rclone.log"  # log file path
+
+# How often to create a new backup: daily | weekly | monthly
+BACKUP_FREQUENCY="monthly"
+
+# --- Email (sendmail only) ---
+MAIL_TO="gocozyhomes2021@gmail.com"
+MAIL_FROM="do-not-reply@gocozyhomes.com"
+MAIL_SUBJECT_PREFIX="[Backup GoCozyHomes]"
+
+# --- Database config ---  (use ~/.my.cnf; leave USER/PASS blank)
+DB_HOST=""                 # empty -> defaults to localhost
+DB_USER=""                 # leave empty to use ~/.my.cnf
+DB_PASS=""                 # leave empty to use ~/.my.cnf
+DBS=("uhdtdbmy_cozyhomes")
+# =================================
+
+DATE="$(date +'%Y-%m-%d')"
+START_TS=$(date +%s)
+HOST="$(hostname)"
+
+case "${BACKUP_FREQUENCY}" in
+  daily)   PERIOD_TAG="$(date +'%Y-%m-%d')" ;;
+  weekly)  PERIOD_TAG="$(date +'%G-W%V')" ;;
+  monthly) PERIOD_TAG="$(date +'%Y-%m')" ;;
+  *)       PERIOD_TAG="$(date +'%Y-%m')" ;;
+esac
+
+BASENAME="${PERIOD_TAG}"
+WORK_DIR="$(mktemp -d /tmp/backup_${PERIOD_TAG}_XXXX)"
+SQL_DIR="${WORK_DIR}/sql"
+ZIP_FILE="${BACKUP_DIR}/${BASENAME}.zip"
+
+STATUS="SUCCESS"
+ERROR_MSG=""
+ZIP_SIZE=""
+SQL_BYTES=0
+SQL_SIZE_HUMAN=""
+REUSED_ZIP=false
+SKIPPED_REMOTE=false
+
+send_email() {
+  local subject="$1" body="$2"
+  local sm="/usr/sbin/sendmail"; [[ -x /usr/lib/sendmail ]] && sm="/usr/lib/sendmail"
+  if [[ -x "$sm" ]]; then
+    { printf "To: %s\nFrom: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s\n" \
+        "$MAIL_TO" "$MAIL_FROM" "$subject" "$body"; } | "$sm" -t
+  else
+    { echo "=== EMAIL (sendmail not found) ==="; echo "Subject: $subject"; echo "$body"; echo "==============================="; } >> "$LOG_FILE"
+  fi
+}
+
+on_error() {
+  local exit_code=$?
+  STATUS="FAILURE"
+  ERROR_MSG="Command failed (exit $exit_code): $BASH_COMMAND"
+  # quarantine a bad/incomplete zip to avoid append errors next run
+  if [[ -f "$ZIP_FILE" ]]; then
+    if command -v unzip >/dev/null 2>&1; then
+      if ! unzip -tqq "$ZIP_FILE" >/dev/null 2>&1; then
+        mv -f "$ZIP_FILE" "${ZIP_FILE}.bad.$(date +%s)" 2>/dev/null || rm -f "$ZIP_FILE" || true
+      fi
+    else
+      # if unzip not available, still quarantine 0-byte files
+      [[ ! -s "$ZIP_FILE" ]] && mv -f "$ZIP_FILE" "${ZIP_FILE}.bad.$(date +%s)" 2>/dev/null || true
+    fi
+  fi
+  return $exit_code
+}
+trap on_error ERR
+
+finish() {
+  local end_ts duration_s duration_hms log_tail now remote_note
+  end_ts=$(date +%s)
+  duration_s=$(( end_ts - START_TS ))
+  duration_hms=$(printf "%02d:%02d:%02d" $((duration_s/3600)) $(((duration_s%3600)/60)) $((duration_s%60)))
+
+  [[ -f "$ZIP_FILE" ]] && ZIP_SIZE=$(du -h "$ZIP_FILE" | awk '{print $1}')
+  if compgen -G "$SQL_DIR/*.gz" > /dev/null; then
+    SQL_BYTES=$(du -cb "$SQL_DIR"/*.gz | tail -1 | awk '{print $1}')
+    if   [[ "$SQL_BYTES" -lt 1024 ]]; then SQL_SIZE_HUMAN="${SQL_BYTES}B"
+    elif [[ "$SQL_BYTES" -lt 1048576 ]]; then SQL_SIZE_HUMAN="$((SQL_BYTES/1024))K"
+    elif [[ "$SQL_BYTES" -lt 1073741824 ]]; then SQL_SIZE_HUMAN="$((SQL_BYTES/1048576))M"
+    else SQL_SIZE_HUMAN="$(awk -v b="$SQL_BYTES" 'BEGIN{printf "%.1fG", b/1073741824}')"
+    fi
+  fi
+
+  now="$(date -Is)"
+  log_tail="$(tail -n 60 "$LOG_FILE" 2>/dev/null || true)"
+  remote_note="$REMOTE/$(basename "$ZIP_FILE")"
+
+  local subject="${MAIL_SUBJECT_PREFIX} ${STATUS}$([[ "$SKIPPED_REMOTE" == true ]] && echo ' (ALREADY ON REMOTE)') - ${BASENAME} on ${HOST}"
+  read -r -d '' body <<EOF || true
+Backup status: ${STATUS}
+Host: ${HOST}
+Date: ${DATE}
+Period: ${BACKUP_FREQUENCY} (${BASENAME})
+Source dir: ${SOURCE_DIR}
+
+Local zip: ${ZIP_FILE}
+Zip size: ${ZIP_SIZE:-n/a}
+Reused existing zip: ${REUSED_ZIP}
+Skipped because already on remote: ${SKIPPED_REMOTE}
+
+Databases: ${DBS[*]}
+DB dumps (compressed): ${SQL_SIZE_HUMAN:-n/a}
+
+Remote target: ${REMOTE}
+Remote file: ${remote_note}
+
+Log file: ${LOG_FILE}
+Finished at: ${now}
+Duration: ${duration_hms}
+
+$( [[ "$STATUS" = "FAILURE" ]] && echo "Error: ${ERROR_MSG}" )
+
+--- Last 60 log lines ---
+${log_tail}
+EOF
+
+  send_email "$subject" "$body"
+  rm -rf "$WORK_DIR"
+}
+trap finish EXIT
+
+# Prevent overlapping runs
+LOCKFILE="/tmp/backup_to_b2.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  echo "Another backup is running; exiting." | tee -a "$LOG_FILE"
+  STATUS="FAILURE"; ERROR_MSG="Lockfile in use"
+  exit 1
+fi
+
+mkdir -p "$BACKUP_DIR" "$(dirname "$LOG_FILE")" "$SQL_DIR"
+echo "[$(date -Is)] Starting backup for period ${BASENAME}" | tee -a "$LOG_FILE"
+
+# ---------- MySQL dump options ----------
+: "${DB_HOST:=localhost}"
+MYSQL_OPTS=(--host="$DB_HOST" --single-transaction --quick --hex-blob)
+[[ -n "${DB_USER:-}" ]] && MYSQL_OPTS+=(--user="$DB_USER")
+[[ -n "${DB_PASS:-}" ]] && MYSQL_OPTS+=(--password="$DB_PASS")
+
+# ---------- Remote skip check ----------
+if rclone lsf "$REMOTE" --include "${BASENAME}.zip" --log-level=INFO --log-file="$LOG_FILE" | grep -qx "${BASENAME}.zip"; then
+  echo "Backup for ${BASENAME} already exists on remote. Skipping." | tee -a "$LOG_FILE"
+  STATUS="SUCCESS"; SKIPPED_REMOTE=true
+  exit 0
+fi
+
+# ---------- Local reuse check ----------
+if [[ -f "$ZIP_FILE" ]]; then
+  if command -v unzip >/dev/null 2>&1 && unzip -tqq "$ZIP_FILE" >/dev/null 2>&1; then
+    echo "Found valid local archive for ${BASENAME}, reusing: $ZIP_FILE" | tee -a "$LOG_FILE"
+    REUSED_ZIP=true
+  else
+    echo "Local archive invalid. Quarantining and rebuilding." | tee -a "$LOG_FILE"
+    mv -f "$ZIP_FILE" "${ZIP_FILE}.bad.$(date +%s)" 2>/dev/null || rm -f "$ZIP_FILE" || true
+  fi
+fi
+
+# ---------- Only create dumps/zip if NOT reusing ----------
+if [[ "$REUSED_ZIP" == false ]]; then
+  # Dump DBs (compressed)
+  for DB in "${DBS[@]}"; do
+    OUT="${SQL_DIR}/${DB}_${DATE}.sql.gz"
+    echo "Dumping DB: $DB -> $OUT" | tee -a "$LOG_FILE"
+    mysqldump "${MYSQL_OPTS[@]}" "$DB" | gzip -c > "$OUT"
+  done
+
+  # Load exclude patterns
+  EX_PATTERNS=()
+  if [[ -n "${EXCLUDES_FILE:-}" && -f "$EXCLUDES_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -z "$line" ]] && continue
+      EX_PATTERNS+=("$line")
+    done < "$EXCLUDES_FILE"
+  fi
+  should_exclude() {
+    local rel="$1"
+    for pat in "${EX_PATTERNS[@]}"; do
+      [[ "$rel" == $pat ]] && return 0
+    done
+    return 1
+  }
+
+  # Helper for file size (GNU/BSD stat)
+  filesize() {
+    local f="$1"
+    if stat -c%s "$f" >/dev/null 2>&1; then stat -c%s "$f"; else stat -f%z "$f"; fi
+  }
+
+  # Build lists and total size
+  TOTAL_BYTES=0
+  declare -a SQL_LIST=()
+  if compgen -G "$SQL_DIR/*.gz" > /dev/null; then
+    while IFS= read -r -d '' f; do
+      SQL_LIST+=("$f")
+      (( TOTAL_BYTES += $(filesize "$f") ))
+    done < <(find "$SQL_DIR" -type f -name '*.gz' -print0)
+  fi
+
+  declare -a SRC_LIST=()
+  ( cd "$SOURCE_DIR"
+    while IFS= read -r -d '' f; do
+      rel="${f#./}"
+      if [[ ${#EX_PATTERNS[@]} -gt 0 ]] && should_exclude "$rel"; then
+        continue
+      fi
+      SRC_LIST+=("$rel")
+      (( TOTAL_BYTES += $(filesize "$f") ))
+    done < <(find . -type f -print0)
+  )
+
+  # CLI progress
+  SHOW_PROGRESS=0; [[ -t 1 ]] && SHOW_PROGRESS=1
+  CUM_BYTES=0
+  progress() {
+    if (( SHOW_PROGRESS )); then
+      pct=$(( TOTAL_BYTES > 0 ? (CUM_BYTES * 100 / TOTAL_BYTES) : 100 ))
+      printf "\rZipping: %3d%% (%s / %s bytes)" "$pct" "$CUM_BYTES" "$TOTAL_BYTES"
+    fi
+  }
+
+  # Add SQL dumps under "sql/"
+  if (( ${#SQL_LIST[@]} > 0 )); then
+    ( cd "$WORK_DIR"
+      for f in "${SQL_LIST[@]}"; do
+        rel="sql/$(basename "$f")"
+        zip -9 -q "$ZIP_FILE" "$rel"
+        (( CUM_BYTES += $(filesize "$f") ))
+        progress
+      done
+    )
+  fi
+
+  # Add site files as relative paths
+  ( cd "$SOURCE_DIR"
+    for rel in "${SRC_LIST[@]}"; do
+      zip -9 -q "$ZIP_FILE" "$rel"
+      (( CUM_BYTES += $(filesize "$rel") ))
+      progress
+    done
+  )
+
+  (( SHOW_PROGRESS )) && echo ""
+
+  # Validate the final zip
+  if [[ ! -s "$ZIP_FILE" ]]; then
+    echo "Zip file is empty or missing: $ZIP_FILE" | tee -a "$LOG_FILE"
+    STATUS="FAILURE"; ERROR_MSG="Zip file missing or empty"; exit 4
+  fi
+  if command -v unzip >/dev/null 2>&1; then
+    if ! unzip -tqq "$ZIP_FILE" >/dev/null 2>&1; then
+      echo "Zip integrity test failed for $ZIP_FILE" | tee -a "$LOG_FILE"
+      STATUS="FAILURE"; ERROR_MSG="Zip integrity test failed"; exit 4
+    fi
+  fi
+else
+  echo "Skipping zipping step (reusing ${ZIP_FILE})." | tee -a "$LOG_FILE"
+fi
+
+# ---------- Upload to B2 ----------
+echo "Uploading to remote: $REMOTE" | tee -a "$LOG_FILE"
+rclone copy "$ZIP_FILE" "$REMOTE" \
+  --transfers=1 --checkers=4 \
+  --b2-chunk-size=96M \
+  --retries=10 --low-level-retries=20 \
+  --buffer-size=64M --bwlimit="$BWLIMIT" \
+  --log-level=INFO --log-file="$LOG_FILE"
+
+# Verify uploaded file exists remotely
+if ! rclone lsf "$REMOTE" --include "${BASENAME}.zip" --log-level=INFO --log-file="$LOG_FILE" | grep -qx "${BASENAME}.zip"; then
+  echo "Remote verification failed: file not found after upload." | tee -a "$LOG_FILE"
+  STATUS="FAILURE"; ERROR_MSG="Remote verification failed"; exit 5
+fi
+
+# ---------- Retention ----------
+echo "Pruning local backups older than ${KEEP_LOCAL_DAYS} days" | tee -a "$LOG_FILE"
+find "$BACKUP_DIR" -type f -name "*.zip" -mtime +$KEEP_LOCAL_DAYS -print -delete >> "$LOG_FILE" 2>&1 || true
+
+echo "Pruning remote backups older than ${KEEP_REMOTE_DAYS} days" | tee -a "$LOG_FILE"
+rclone delete "$REMOTE" --min-age "${KEEP_REMOTE_DAYS}d" --include "*.zip" --log-level=INFO --log-file="$LOG_FILE" || true
+rclone rmdirs "$REMOTE" --leave-root --log-level=INFO --log-file="$LOG_FILE" || true
+
+echo "[$(date -Is)] Backup finished: $ZIP_FILE" | tee -a "$LOG_FILE"
+

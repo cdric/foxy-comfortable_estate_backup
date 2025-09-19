@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =======================
+# Config (edit as needed)
+# =======================
+REMOTE_BASE="b2:cozyhomes-www/backups"     # rclone remote:bucket/prefix that holds your backups
+DOWNLOAD_BASE="${HOME}/gocozyhomes-backups/b2/cozyhomes-downloads" # where to place downloaded archives
+BWLIMIT="0"                                 # rclone bandwidth limit; "0" = unlimited
+RCLONE_BIN="${RCLONE_BIN:-}"                # optional override to rclone binary path
+
+# Conservative defaults (good for small instances / shared hosting)
+RCLONE_TRANSFERS="1"
+RCLONE_CHECKERS="1"
+RCLONE_B2_CHUNK="32M"
+RCLONE_BUFFER="32M"
+
+# =======================
+# Script options
+# =======================
+DO_LIST=false
+DO_LATEST=false
+DO_VERIFY_ZIPS=true
+SELECT_NAME=""
+EXTRACT_TO="${HOME}/gocozyhomes-backups/b2/cozyhomes-extracts" #where to unzip the content
+
+usage() {
+  cat <<'EOF'
+Usage: fetch_backup.sh [options]
+
+Options:
+  --list                 List available backup periods and exit.
+  --latest               Auto-select the most recent backup period.
+  --select NAME          Select a specific backup folder name (as listed).
+  --verify-zips          After download, CRC-test each .zip via unzip -t.
+  --extract DIR          After successful download, extract all chunks into DIR.
+  --download-dir DIR     Change download base directory (default: ~/cozyhomes-downloads).
+  --remote REMOTE        Change rclone remote base (default: b2:cozyhomes-www/backups).
+  -h, --help             Show this help and exit.
+
+Examples:
+  fetch_backup.sh --list
+  fetch_backup.sh --latest
+  fetch_backup.sh --select home4_..._2025-08
+  fetch_backup.sh --latest --verify-zips --extract /tmp/restore
+EOF
+}
+
+log() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
+
+# Detect if we can show live progress bars (interactive terminal)
+is_tty() { [[ -t 1 ]] || [[ -t 2 ]]; }
+
+# Find rclone
+find_rclone() {
+  local candidates=(
+    "$RCLONE_BIN"
+    "$HOME/bin/rclone"
+    "$HOME/.local/bin/rclone"
+    "/usr/local/bin/rclone" "/usr/bin/rclone"
+    "$(command -v rclone 2>/dev/null || true)"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+RCLONE="$(find_rclone || true)"
+if [[ -z "${RCLONE}" ]]; then
+  echo "ERROR: rclone not found. Install rclone or set RCLONE_BIN=/path/to/rclone" >&2
+  exit 1
+fi
+
+# ---------- Utilities ----------
+list_periods() {
+  # rclone lsf with --dirs-only prints names with trailing "/"
+  "$RCLONE" lsf "$REMOTE_BASE" --dirs-only | sed 's:/$::' | awk 'NF'
+}
+
+period_sort_key() {
+  # input: period name on stdin; output: "YYYY-MM[-DD or -Wnn] <TAB> name"
+  awk '
+  {
+    name=$0
+    date=""
+    if (match(name, /[0-9]{4}-[0-9]{2}-[0-9]{2}$/)) { date=substr(name, RSTART, RLENGTH) }
+    else if (match(name, /[0-9]{4}-W[0-9]{2}$/))   { date=substr(name, RSTART, RLENGTH) }
+    else if (match(name, /[0-9]{4}-[0-9]{2}$/))    { date=substr(name, RSTART, RLENGTH) }
+    else { date="0000-00" }
+    print date "\t" name
+  }'
+}
+
+# Print the menu to STDERR; emit only the chosen name to STDOUT
+choose_interactive() {
+  local arr=("$@")
+  {
+    echo
+    echo "Select a backup to download:"
+    local i=1
+    for x in "${arr[@]}"; do
+      printf "  %2d) %s\n" "$i" "$x"
+      i=$((i+1))
+    done
+    echo
+  } >&2
+
+  local choice
+  while true; do
+    read -rp "Enter a number (1-${#arr[@]}): " choice </dev/tty
+    [[ "$choice" =~ ^[0-9]+$ ]] || { echo "Please enter a valid number." >&2; continue; }
+    (( choice>=1 && choice<=${#arr[@]} )) || { echo "Out of range." >&2; continue; }
+    echo "${arr[$((choice-1))]}"
+    return 0
+  done
+}
+
+verify_remote_to_local_sizes() {
+  local remote_dir="$1" local_dir="$2"
+  # Compare sizes (fast, catches 0-byte partials). one-way: every remote file must exist in local.
+  "$RCLONE" check "$remote_dir" "$local_dir" \
+    --size-only --one-way \
+    --checkers="$RCLONE_CHECKERS" \
+    --log-level=INFO --log-file="${DOWNLOAD_BASE}/fetch_check.log"
+}
+
+need_zip_lister() {
+  if command -v unzip >/dev/null 2>&1; then
+    echo "unzip"
+  elif command -v zipinfo >/dev/null 2>&1; then
+    echo "zipinfo"
+  else
+    echo ""
+  fi
+}
+
+# Build a unified file list from all downloaded chunk ZIPs
+# Outputs a sorted unique list (no directories), with any leading "./" stripped.
+list_from_zip_chunks() {
+  local chunks_root="$1"
+  local lister
+  lister="$(need_zip_lister)"
+  if [[ -z "$lister" ]]; then
+    echo "ERROR: Neither unzip nor zipinfo found; cannot verify manifests." >&2
+    return 2
+  fi
+
+  if ! compgen -G "$chunks_root/*.zip" >/dev/null 2>&1 && ! compgen -G "$chunks_root/**/*.zip" >/dev/null 2>&1; then
+    echo "ERROR: No .zip chunks found under $chunks_root" >&2
+    return 3
+  fi
+
+  if [[ "$lister" == "unzip" ]]; then
+    find "$chunks_root" -type f -name '*.zip' -print0 \
+    | xargs -0 -I{} unzip -Z1 "{}" \
+    | sed -e '/\/$/d' -e 's#^\./##' \
+    | LC_ALL=C sort -u
+  else
+    find "$chunks_root" -type f -name '*.zip' -print0 \
+    | xargs -0 -I{} zipinfo -1 "{}" \
+    | sed -e '/\/$/d' -e 's#^\./##' \
+    | LC_ALL=C sort -u
+  fi
+}
+
+# Compare two sorted lists: A (expected) vs B (actual list from zips).
+# Exits non-zero if there are missing entries.
+compare_sorted_lists() {
+  local expected="$1" actual="$2" tag="$3"
+  local missing extra
+  missing="$(comm -23 "$expected" "$actual" | wc -l | awk '{print $1}')"
+  extra="$(comm -13 "$expected" "$actual" | wc -l | awk '{print $1}')"
+  if (( missing > 0 )); then
+    echo "ERROR: $missing paths are MISSING from downloaded chunks relative to $tag." >&2
+    echo "Sample missing (up to 50):"
+    comm -23 "$expected" "$actual" | head -n 50 >&2
+    return 4
+  fi
+  if (( extra > 0 )); then
+    echo "NOTE: $extra extra paths exist in downloaded chunks not present in $tag." >&2
+    echo "Sample extra (up to 50):"
+    comm -13 "$expected" "$actual" | head -n 50 >&2
+  fi
+  return 0
+}
+
+crc_test_zips() {
+  local root="$1"
+  if ! command -v unzip >/dev/null 2>&1; then
+    log "unzip not found; skipping CRC tests."
+    return 0
+  fi
+  local bad=0 total=0
+  while IFS= read -r -d '' z; do
+    total=$((total+1))
+    if ! unzip -tqq "$z" >/dev/null 2>&1; then
+      echo "CRC FAIL: $z"
+      bad=$((bad+1))
+    fi
+  done < <(find "$root" -type f -name '*.zip' -print0)
+  if (( bad>0 )); then
+    echo "ERROR: $bad/$total zip chunks failed CRC." >&2
+    return 1
+  fi
+  log "All $total zip chunks passed CRC."
+}
+
+extract_all() {
+  local src_dir="$1" dest_dir="$2"
+  mkdir -p "$dest_dir"
+  while IFS= read -r -d '' z; do
+    (cd "$dest_dir" && unzip -n "$z" >/dev/null)
+  done < <(find "$src_dir" -type f -name '*.zip' -print0)
+  log "Extraction complete to: $dest_dir"
+}
+
+human_from_bytes() {
+  awk -v b="$1" 'BEGIN{
+    if(b<1024)         printf "%d B", b;
+    else if(b<1048576) printf "%.0f KB", b/1024;
+    else if(b<1073741824) printf "%.1f MB", b/1048576;
+    else printf "%.2f GB", b/1073741824
+  }'
+}
+
+# =======================
+# Parse args
+# =======================
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --list) DO_LIST=true; shift ;;
+    --latest) DO_LATEST=true; shift ;;
+    --select) SELECT_NAME="${2:-}"; shift 2 ;;
+    --verify-zips) DO_VERIFY_ZIPS=true; shift ;;
+    --extract) EXTRACT_TO="${2:-}"; shift 2 ;;
+    --download-dir) DOWNLOAD_BASE="${2:-}"; shift 2 ;;
+    --remote) REMOTE_BASE="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+mkdir -p "$DOWNLOAD_BASE"
+
+# 1) Build sorted list of periods
+mapfile -t PERIODS < <(list_periods | period_sort_key | sort -k1,1 -k2,2 | awk -F'\t' '{print $2}')
+if (( ${#PERIODS[@]} == 0 )); then
+  echo "No backup periods found under $REMOTE_BASE" >&2
+  exit 3
+fi
+
+if $DO_LIST; then
+  printf "Available backups under %s:\n" "$REMOTE_BASE" >&2
+  for p in "${PERIODS[@]}"; do echo "  $p" >&2; done
+  exit 0
+fi
+
+# 2) Choose target (print UI to STDERR; capture only the selected name)
+TARGET=""
+if [[ -n "$SELECT_NAME" ]]; then
+  TARGET="$SELECT_NAME"
+elif $DO_LATEST; then
+  TARGET="${PERIODS[-1]}"
+else
+  TARGET="$(choose_interactive "${PERIODS[@]}")"
+fi
+if [[ -z "$TARGET" ]]; then
+  echo "No selection made; exiting." >&2
+  exit 2
+fi
+
+REMOTE_DIR="${REMOTE_BASE}/${TARGET}"
+LOCAL_DIR="${DOWNLOAD_BASE}/${TARGET}"
+mkdir -p "$LOCAL_DIR"
+
+# Pre-flight: ensure the remote period actually contains zip chunks
+if ! "$RCLONE" lsf "$REMOTE_DIR" --files-only --include "*.zip" >/dev/null 2>&1; then
+  echo "ERROR: No .zip chunks found on remote in: $REMOTE_DIR" >&2
+  echo "Available items there:" >&2
+  "$RCLONE" lsf "$REMOTE_DIR" >&2 || true
+  exit 4
+fi
+
+# 2.5) Build an explicit file list for the transfer (zips + manifests + marker if present)
+WORK_DIR="$(mktemp -d "${DOWNLOAD_BASE}/dl_${TARGET}_XXXX")"
+trap 'rm -rf "$WORK_DIR"' EXIT
+FILELIST="${WORK_DIR}/files.txt"
+
+# List files (relative names) in the period
+"$RCLONE" lsf "$REMOTE_DIR" --files-only > "$FILELIST"
+# Optionally, restrict to specific patterns; here we keep all files
+# but ensure at least *.zip present (already checked above).
+
+# Compute total size for progress summary (helps user expectations)
+TOTAL_BYTES=0
+while IFS= read -r f; do
+  # rclone lsl prints: size  date time  name
+  # Use --include to just get this file
+  sz="$("$RCLONE" lsl "$REMOTE_DIR" --include "$f" | awk '{s=$1} END{print s+0}')" || sz=0
+  TOTAL_BYTES=$(( TOTAL_BYTES + sz ))
+done < "$FILELIST"
+
+log "Preparing to download: $TARGET"
+log "Total files: $(wc -l < "$FILELIST" | awk '{print $1}'); Total size: $(human_from_bytes "$TOTAL_BYTES")"
+
+# 3) Download with live progress bars when interactive
+RCLONE_COMMON_ARGS=(
+  --transfers="$RCLONE_TRANSFERS" --checkers="$RCLONE_CHECKERS"
+  --b2-chunk-size="$RCLONE_B2_CHUNK" --b2-upload-cutoff="$RCLONE_B2_CHUNK"
+  --buffer-size="$RCLONE_BUFFER" --bwlimit="$BWLIMIT"
+  --disable-http2
+  --log-level=INFO --log-file="${DOWNLOAD_BASE}/fetch_copy.log"
+)
+
+if is_tty; then
+  echo
+  echo "Downloading with live progress (per-file + overall ETA)…"
+  echo "Tip: rclone shows one line per active file plus an overall summary line."
+  echo
+  "$RCLONE" copy "$REMOTE_DIR" "$LOCAL_DIR" \
+    --files-from "$FILELIST" \
+    --progress --stats=1s --stats-file-name-length 64 \
+    "${RCLONE_COMMON_ARGS[@]}"
+else
+  log "Non-interactive session detected: running without live progress UI."
+  "$RCLONE" copy "$REMOTE_DIR" "$LOCAL_DIR" \
+    --files-from "$FILELIST" \
+    "${RCLONE_COMMON_ARGS[@]}"
+fi
+
+# Sanity check: confirm we actually received some chunks
+if ! compgen -G "$LOCAL_DIR/*.zip" >/dev/null 2>&1 && ! compgen -G "$LOCAL_DIR/**/*.zip" >/dev/null 2>&1; then
+  echo "ERROR: Download completed but no .zip chunks found under $LOCAL_DIR" >&2
+  exit 5
+fi
+
+# 4) Verify sizes (detect any zero-byte/partial files)
+log "Verifying remote -> local by size…"
+if ! verify_remote_to_local_sizes "$REMOTE_DIR" "$LOCAL_DIR"; then
+  echo "ERROR: Size verification failed. See ${DOWNLOAD_BASE}/fetch_check.log" >&2
+  exit 6
+fi
+log "Size verification OK."
+
+# 5) Manifest-based verification (compare ZIP contents to expected/archived lists)
+EXPECTED_MAN="${LOCAL_DIR}/manifest.expected"
+ARCHIVED_MAN="${LOCAL_DIR}/manifest.archived"
+REL_LIST="${WORK_DIR}/from_zips.sorted"
+
+log "Building file list from downloaded chunks…"
+list_from_zip_chunks "$LOCAL_DIR" > "$REL_LIST"
+
+if [[ -s "$EXPECTED_MAN" ]]; then
+  log "Verifying ZIP contents against manifest.expected…"
+  EXP_SORTED="${WORK_DIR}/expected.sorted"
+  LC_ALL=C sort -u "$EXPECTED_MAN" > "$EXP_SORTED"
+  compare_sorted_lists "$EXP_SORTED" "$REL_LIST" "manifest.expected"
+  log "Manifest.expected verification OK."
+elif [[ -s "$ARCHIVED_MAN" ]]; then
+  log "manifest.expected not found; verifying against manifest.archived…"
+  ARC_SORTED="${WORK_DIR}/archived.sorted"
+  LC_ALL=C sort -u "$ARCHIVED_MAN" > "$ARC_SORTED"
+  compare_sorted_lists "$ARC_SORTED" "$REL_LIST" "manifest.archived"
+  log "Manifest.archived verification OK."
+else
+  echo "WARNING: Neither manifest.expected nor manifest.archived found in $LOCAL_DIR; skipping manifest verification." >&2
+fi
+
+# Optional: cross-check expected vs archived if both exist
+if [[ -s "$EXPECTED_MAN" && -s "$ARCHIVED_MAN" ]]; then
+  EXP_SORTED="${WORK_DIR}/expected.sorted"
+  ARC_SORTED="${WORK_DIR}/archived.sorted"
+  LC_ALL=C sort -u "$EXPECTED_MAN" > "$EXP_SORTED"
+  LC_ALL=C sort -u "$ARCHIVED_MAN" > "$ARC_SORTED"
+  if ! diff -q "$EXP_SORTED" "$ARC_SORTED" >/dev/null 2>&1; then
+    echo "NOTE: manifest.expected and manifest.archived differ." >&2
+    echo "Sample diff (up to 50 lines):" >&2
+    diff --unified=0 "$EXP_SORTED" "$ARC_SORTED" | head -n 50 >&2 || true
+  fi
+fi
+
+# 6) Optional CRC test for each zip
+if $DO_VERIFY_ZIPS; then
+  log "CRC-testing zip chunks…"
+  crc_test_zips "$LOCAL_DIR"
+fi
+
+# 7) Optional extraction
+if [[ -n "$EXTRACT_TO" ]]; then
+  log "Extracting into: $EXTRACT_TO"
+  extract_all "$LOCAL_DIR" "$EXTRACT_TO"
+fi
+
+log "Done. Downloaded archive is in: $LOCAL_DIR"
+if [[ -f "$LOCAL_DIR/UPLOADED.OK" ]]; then
+  log "UPLOADED.OK present in the downloaded archive."
+else
+  log "NOTE: UPLOADED.OK not found in the downloaded archive."
+fi

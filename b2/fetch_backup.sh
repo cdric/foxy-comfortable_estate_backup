@@ -16,6 +16,10 @@ RCLONE_CHECKERS="1"
 RCLONE_B2_CHUNK="32M"
 RCLONE_BUFFER="32M"
 
+# Reliability
+RCLONE_RETRIES="10"
+RCLONE_LL_RETRIES="20"
+
 # =======================
 # Script options
 # =======================
@@ -41,12 +45,6 @@ Options:
   --download-dir DIR     Change local download directory (default preset).
   --remote REMOTE        Change rclone remote base (default preset).
   -h, --help             Show this help and exit.
-
-Examples:
-  fetch_backup.sh --list
-  fetch_backup.sh --latest
-  fetch_backup.sh --select home4_..._2025-08
-  fetch_backup.sh --latest --no-extract
 EOF
 }
 
@@ -116,11 +114,13 @@ choose_interactive() {
 }
 
 verify_remote_to_local_sizes() {
-  local remote_dir="$1" local_dir="$2"
+  local remote_dir="$1" local_dir="$2" filelist="$3"
   "$RCLONE" check "$remote_dir" "$local_dir" \
-    --size-only --one-way \
+    --files-from "$filelist" \
+    --checksum --one-way \
     --checkers="$RCLONE_CHECKERS" \
-    --log-level=INFO --log-file="${DOWNLOAD_BASE}/fetch_check.log"
+    --log-level=INFO --log-file="${DOWNLOAD_BASE}/fetch_check.log" \
+    "${RCLONE_SNAPSHOT[@]}"
 }
 
 need_zip_lister() {
@@ -208,7 +208,6 @@ crc_test_zips_progress() {
     each_avg=$(( i > 0 ? (elapsed / i) : 0 ))
     remain=$(( (total - i) * each_avg ))
     eta="$(format_hms "$remain")"
-    # Trim long names for readability
     short="$(basename "$fname")"
     printf "\r[%4d/%4d] ETA %s  %s" "$i" "$total" "$eta" "$short"
     if unzip -tqq "$fname" >/dev/null 2>&1; then
@@ -310,29 +309,45 @@ REMOTE_DIR="${REMOTE_BASE}/${TARGET}"
 LOCAL_DIR="${DOWNLOAD_BASE}/${TARGET}"
 mkdir -p "$LOCAL_DIR"
 
-# Pre-flight: ensure the remote period actually contains zip chunks
-if ! "$RCLONE" lsf "$REMOTE_DIR" --files-only --include "*.zip" >/dev/null 2>&1; then
+# Freeze the view of the bucket to avoid racing uploads
+SNAP_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RCLONE_SNAPSHOT=( --b2-version-at="$SNAP_TS" )
+
+# Pre-flight: ensure the remote period actually contains zip chunks and is sealed
+if ! "$RCLONE" lsf "$REMOTE_DIR" --files-only --include "*.zip" "${RCLONE_SNAPSHOT[@]}" >/dev/null 2>&1; then
   echo "ERROR: No .zip chunks found on remote in: $REMOTE_DIR" >&2
   echo "Available items there:" >&2
-  "$RCLONE" lsf "$REMOTE_DIR" >&2 || true
+  "$RCLONE" lsf "$REMOTE_DIR" "${RCLONE_SNAPSHOT[@]}" >&2 || true
+  exit 4
+fi
+if ! "$RCLONE" lsf "$REMOTE_DIR" --files-only --include "UPLOADED.OK" "${RCLONE_SNAPSHOT[@]}" >/dev/null 2>&1; then
+  echo "Backup not sealed yet: UPLOADED.OK missing in ${REMOTE_DIR}. Try again later." >&2
   exit 4
 fi
 
-# 2.5) Build explicit file list & compute total size
+# 2.5) Build explicit (RECURSIVE) file list & compute total size
 WORK_DIR="$(mktemp -d "${DOWNLOAD_BASE}/dl_${TARGET}_XXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
 FILELIST="${WORK_DIR}/files.txt"
 
-"$RCLONE" lsf "$REMOTE_DIR" --files-only > "$FILELIST"
+# >>> FIX: recursive lsf so subfolders like sql/*.gz are included
+"$RCLONE" lsf "$REMOTE_DIR" --files-only -R "${RCLONE_SNAPSHOT[@]}" > "$FILELIST"
 
 TOTAL_BYTES=0
 while IFS= read -r f; do
-  sz="$("$RCLONE" lsl "$REMOTE_DIR" --include "$f" | awk '{s=$1} END{print s+0}')" || sz=0
+  sz="$("$RCLONE" lsl "$REMOTE_DIR" --include "$f" "${RCLONE_SNAPSHOT[@]}" | awk '{s=$1} END{print s+0}')" || sz=0
   TOTAL_BYTES=$(( TOTAL_BYTES + sz ))
 done < "$FILELIST"
 
 log "Preparing to download: $TARGET"
 log "Total files: $(wc -l < "$FILELIST" | awk '{print $1}'); Total size: $(human_from_bytes "$TOTAL_BYTES")"
+
+# Sanity: free space >= total * 1.2
+FREE_BYTES=$(df -P "$LOCAL_DIR" | awk 'NR==2{print $4*1024}')
+if (( FREE_BYTES < TOTAL_BYTES * 12 / 10 )); then
+  echo "ERROR: Not enough free space. Need ~$(human_from_bytes $((TOTAL_BYTES*12/10))) free." >&2
+  exit 7
+fi
 
 # 3) Download with live progress bars when interactive
 RCLONE_COMMON_ARGS=(
@@ -340,7 +355,9 @@ RCLONE_COMMON_ARGS=(
   --b2-chunk-size="$RCLONE_B2_CHUNK" --b2-upload-cutoff="$RCLONE_B2_CHUNK"
   --buffer-size="$RCLONE_BUFFER" --bwlimit="$BWLIMIT"
   --disable-http2
+  --retries="$RCLONE_RETRIES" --low-level-retries="$RCLONE_LL_RETRIES" --retries-sleep=2s
   --log-level=INFO --log-file="${DOWNLOAD_BASE}/fetch_copy.log"
+  "${RCLONE_SNAPSHOT[@]}"
 )
 
 if is_tty; then
@@ -364,13 +381,13 @@ if ! compgen -G "$LOCAL_DIR/*.zip" >/dev/null 2>&1 && ! compgen -G "$LOCAL_DIR/*
   exit 5
 fi
 
-# 4) Verify sizes (detect any zero-byte/partial files)
-log "Verifying remote -> local by size…"
-if ! verify_remote_to_local_sizes "$REMOTE_DIR" "$LOCAL_DIR"; then
-  echo "ERROR: Size verification failed. See ${DOWNLOAD_BASE}/fetch_check.log" >&2
+# 4) Verify remote -> local using the SAME list you copied (and checksums)
+log "Verifying remote -> local by checksum (limited to FILELIST)…"
+if ! verify_remote_to_local_sizes "$REMOTE_DIR" "$LOCAL_DIR" "$FILELIST"; then
+  echo "ERROR: Verification failed. See ${DOWNLOAD_BASE}/fetch_check.log" >&2
   exit 6
 fi
-log "Size verification OK."
+log "Verification OK."
 
 # 5) Manifest-based verification (compare ZIP contents to expected/archived lists)
 EXPECTED_MAN="${LOCAL_DIR}/manifest.expected"

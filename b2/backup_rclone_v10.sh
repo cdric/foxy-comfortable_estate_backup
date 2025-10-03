@@ -20,7 +20,7 @@ LOG_FILE="$HOME_DIR/gocozyhomes-backups/b2/logs/backup_rclone.log"
 # How often to create a new backup: daily | weekly | monthly
 BACKUP_FREQUENCY="monthly"
 
-# Verify even when reusing a local chunk set (not needed usually)
+# Verify even when reusing a local chunk set (0/1)
 VERIFY_REUSED_ARCHIVE=1
 # Limit how many differing paths to print in logs/email
 MAX_DIFF_LINES=200
@@ -37,10 +37,10 @@ DB_PASS=""                 # leave empty to use ~/.my.cnf
 DBS=("uhdtdbmy_cozyhomes")
 
 # ---- chunked archiving config ----
-# Per-run cap for how much compressed data we CREATE (new .zip files)
-CHUNK_BUDGET_MB=51200                     # stop creating new chunks after ~1.5 GB
+# Per-run cap for how much compressed data we CREATE
+CHUNK_BUDGET_MB=51200                      # e.g., 51200MB (~50GB) max new chunks per run
 # Target size for each chunk zip (creation batches)
-CHUNK_TARGET_MB=1500                      # create zips about this big each
+CHUNK_TARGET_MB=1500                       # create zips about this big each
 # =================================
 
 DATE="$(date +'%Y-%m-%d')"
@@ -86,6 +86,8 @@ MISSING_COUNT=""
 EXTRA_COUNT=""
 CREATED_CHUNKS=0
 CREATED_BYTES=0
+SEND_EMAIL=false
+UPLOAD_COMPLETED=false
 
 # ---------- Helpers ----------
 send_email() {
@@ -120,8 +122,11 @@ list_archived_entries() {
     for z in "$PARTS_DIR"/${CHUNK_PREFIX}-*.zip; do
       if command -v unzip >/dev/null 2>&1; then
         unzip -Z1 "$z"
-      else
+      elif command -v zipinfo >/dev/null 2>&1; then
         zipinfo -1 "$z"
+      elif command -v zip >/dev/null 2>&1; then
+        # Fallback: zip -sf prints a report; extract just names
+        zip -sf "$z" | sed -n '/^  listing of: /,$p' | sed '1,2d'
       fi
     done | sed -e '/\/$/d' -e 's#^./##' | LC_ALL=C sort -u
   fi
@@ -164,6 +169,7 @@ on_error() {
   local exit_code=$?
   STATUS="FAILURE"
   ERROR_MSG="Command failed (exit $exit_code): $BASH_COMMAND"
+  SEND_EMAIL=true
   return $exit_code
 }
 trap on_error ERR
@@ -215,7 +221,22 @@ finish() {
 
   now="$(date -Is)"
   log_tail="$(tail -n 60 "$LOG_FILE" 2>/dev/null || true)"
-  local subject="${MAIL_SUBJECT_PREFIX} ${STATUS}$([[ "$SKIPPED_REMOTE" == true ]] && echo ' (UPLOAD SKIPPED)') - ${BASENAME} on ${HOST}"
+
+  # Build subject per policy:
+  # - FAILURE: always email with reason
+  # - SUCCESS with upload completed: email with total uploaded size + period
+  # - Otherwise (skipped / partial): no email
+  local subject=""
+  if [[ "$STATUS" = "FAILURE" ]]; then
+    subject="${MAIL_SUBJECT_PREFIX} FAILURE: ${ERROR_MSG} - ${BASENAME}"
+    SEND_EMAIL=true
+  elif [[ "$UPLOAD_COMPLETED" == true ]]; then
+    subject="${MAIL_SUBJECT_PREFIX} SUCCESS: uploaded ${CHUNK_BYTES_HUMAN} - ${BASENAME}"
+    SEND_EMAIL=true
+  else
+    SEND_EMAIL=false
+  fi
+
   read -r -d '' body <<EOF || true
 Backup status: ${STATUS}
 Host: ${HOST}
@@ -242,7 +263,9 @@ $( [[ "$STATUS" = "FAILURE" ]] && echo "Error: ${ERROR_MSG}" )
 ${log_tail}
 EOF
 
-  send_email "$subject" "$body"
+  if [[ "$SEND_EMAIL" == true ]]; then
+    send_email "$subject" "$body"
+  fi
   rm -rf "$WORK_DIR"
 }
 trap finish EXIT
@@ -469,10 +492,7 @@ if [[ "$MISSING_COUNT" -eq 0 ]]; then
   echo "Uploading to remote: $REMOTE_PREFIX (using $RCLONE)" | tee -a "$LOG_FILE"
   echo "Note: lowering concurrency to avoid Bluehost ulimit issues." | tee -a "$LOG_FILE"
 
-  # Very conservative settings for shared hosting:
-  # - transfers=1 / checkers=1 keeps total goroutines low
-  # - disable http2 avoids extra HTTP worker goroutines
-  # - smaller B2 chunk size further reduces resources per file
+  # Very conservative settings for shared hosting
   "$RCLONE" copy "$PARTS_DIR" "$REMOTE_PREFIX" \
     --transfers=1 --checkers=1 \
     --b2-chunk-size=32M --b2-upload-cutoff=32M \
@@ -492,6 +512,7 @@ if [[ "$MISSING_COUNT" -eq 0 ]]; then
   if remote_is_complete; then
     echo "Remote verification succeeded — writing completion marker." | tee -a "$LOG_FILE"
     write_remote_marker
+    UPLOAD_COMPLETED=true
   else
     echo "Remote verification FAILED after upload — not writing marker." | tee -a "$LOG_FILE"
     STATUS="FAILURE"; ERROR_MSG="Remote incomplete after upload"
